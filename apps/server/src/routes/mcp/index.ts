@@ -1,22 +1,32 @@
 import { StreamableHTTPTransport } from "@hono/mcp";
 import type { Workspace } from "@openstatus/db/src/schema";
+import { resourceMetadataUrl } from "@openstatus/services/oauth";
 import { Hono } from "hono";
 import type { Context, Next } from "hono";
 
 import { handleError } from "../../libs/errors";
 import { authMiddleware } from "../../libs/middlewares/auth";
 import type { Variables } from "../../types";
+import { oauthConfigFromEnv } from "../oauth/config";
 import { toServiceCtx } from "./adapter";
 import { createMcpServer, createPublicMcpServer } from "./server";
 
 export const mcpRoute = new Hono<{ Variables: Variables }>({ strict: false });
+
+const wwwAuthenticate = `Bearer resource_metadata="${resourceMetadataUrl(oauthConfigFromEnv().issuer)}"`;
 
 // Match production's global error handler at the sub-router level so
 // `OpenStatusApiError` (thrown by `authMiddleware` on bad/missing
 // keys) translates to the right HTTP status whether or not the parent
 // app has its own `onError` wired up. This makes the route portable
 // across mount points and self-contained for tests.
-mcpRoute.onError(handleError);
+// A 401 also carries `WWW-Authenticate` (RFC 9728) so OAuth clients can
+// start discovery; the envelope body stays for header-based callers.
+mcpRoute.onError((err, c) => {
+  const res = handleError(err, c);
+  if (res.status === 401) res.headers.set("WWW-Authenticate", wwwAuthenticate);
+  return res;
+});
 
 /**
  * An MCP client `initialize`s before it has a credential, and a handshake that
@@ -32,7 +42,14 @@ async function optionalAuthMiddleware(
   // `=== undefined` rather than a truthiness check: a client that sends the
   // header with an empty value is misconfigured, not anonymous, and should be
   // told so instead of silently dropping to the public surface.
-  if (c.req.header("x-openstatus-key") === undefined) return next();
+  // A bearer token is a credential too; it must be validated, never treated
+  // as anonymous.
+  if (
+    c.req.header("x-openstatus-key") === undefined &&
+    c.req.header("authorization") === undefined
+  ) {
+    return next();
+  }
   return authMiddleware(c, next);
 }
 
